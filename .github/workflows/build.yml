@@ -1,0 +1,1502 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p app/src/main/java/ru/byd/manual
+          mkdir -p app/src/main/res/layout app/src/main/res/menu app/src/main/res/values app/src/main/res/drawable
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BydManual"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "ru.byd.manual"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "ru.byd.manual"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.activity:activity-ktx:1.9.3")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("com.google.mlkit:translate:17.0.3")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/Theme.BydManual">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity
+                      android:name=".SyncActivity"
+                      android:exported="false"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
+                  <activity
+                      android:name=".SearchActivity"
+                      android:exported="false"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden" />
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/ru/byd/manual/YandexDisk.kt <<'EOF'
+          package ru.byd.manual
+
+          import org.json.JSONObject
+          import java.io.IOException
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+
+          object YandexDisk {
+
+              const val PUBLIC_URL = "https://disk.yandex.ru/d/lVVoiFECcf6IRg"
+
+              private const val API = "https://cloud-api.yandex.net/v1/disk/public/resources"
+              private val KEY = URLEncoder.encode(PUBLIC_URL, "UTF-8")
+
+              data class Remote(val path: String, val size: Long, val md5: String?, val url: String?)
+
+              fun open(urlStr: String): HttpURLConnection {
+                  var url = urlStr
+                  repeat(6) {
+                      val c = URL(url).openConnection() as HttpURLConnection
+                      c.instanceFollowRedirects = false
+                      c.connectTimeout = 20000
+                      c.readTimeout = 30000
+                      c.setRequestProperty("User-Agent", "BydManual/1.0")
+                      val code = c.responseCode
+                      if (code in 300..399) {
+                          val loc = c.getHeaderField("Location")
+                          c.disconnect()
+                          if (loc.isNullOrEmpty()) throw IOException("Redirect without location")
+                          url = loc
+                      } else {
+                          if (code !in 200..299) { c.disconnect(); throw IOException("HTTP $code") }
+                          return c
+                      }
+                  }
+                  throw IOException("Too many redirects")
+              }
+
+              private fun getJson(url: String): JSONObject {
+                  var last: Exception? = null
+                  repeat(3) { attempt ->
+                      try {
+                          open(url).inputStream.use { return JSONObject(it.readBytes().toString(Charsets.UTF_8)) }
+                      } catch (e: Exception) {
+                          last = e
+                          Thread.sleep(800L * (attempt + 1))
+                      }
+                  }
+                  throw last ?: IOException("Network error")
+              }
+
+              private fun listDir(path: String): List<JSONObject> {
+                  val out = ArrayList<JSONObject>()
+                  var offset = 0
+                  while (true) {
+                      val u = StringBuilder("$API?public_key=$KEY&limit=200&offset=$offset")
+                      if (path.isNotEmpty()) u.append("&path=").append(URLEncoder.encode(path, "UTF-8"))
+                      val emb = getJson(u.toString()).optJSONObject("_embedded") ?: break
+                      val items = emb.optJSONArray("items") ?: break
+                      for (i in 0 until items.length()) out.add(items.getJSONObject(i))
+                      val total = emb.optInt("total", out.size)
+                      offset += items.length()
+                      if (items.length() == 0 || offset >= total) break
+                      Thread.sleep(100)
+                  }
+                  return out
+              }
+
+              fun listAll(): List<Remote> {
+                  val out = ArrayList<Remote>()
+                  val queue = ArrayDeque<String>()
+                  queue.add("")
+                  while (queue.isNotEmpty()) {
+                      val dir = queue.removeFirst()
+                      for (it in listDir(dir)) {
+                          val p = it.getString("path")
+                          if (it.getString("type") == "dir") queue.add(p)
+                          else out.add(
+                              Remote(p, it.optLong("size", 0),
+                                  it.optString("md5", null), it.optString("file", null))
+                          )
+                      }
+                  }
+                  return out
+              }
+
+              fun downloadHref(path: String): String {
+                  val u = "$API/download?public_key=$KEY&path=" + URLEncoder.encode(path, "UTF-8")
+                  return getJson(u).getString("href")
+              }
+          }
+          EOF
+          cat > app/src/main/java/ru/byd/manual/ManualStore.kt <<'EOF'
+          package ru.byd.manual
+
+          import android.content.Context
+          import org.json.JSONObject
+          import java.io.File
+          import java.nio.ByteBuffer
+          import java.nio.charset.CharacterCodingException
+          import java.nio.charset.Charset
+          import java.nio.charset.CodingErrorAction
+
+          class ManualStore(context: Context) {
+
+              private val prefs = context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+              val root = File(context.filesDir, "manual")
+              private val manifestFile = File(context.filesDir, "manifest.json")
+              private val rootCanonical by lazy { root.canonicalPath }
+
+              var translateEnabled: Boolean
+                  get() = prefs.getBoolean("translate", true)
+                  set(v) { prefs.edit().putBoolean("translate", v).apply() }
+
+              private val indexByLower by lazy {
+                  root.walkTopDown().filter { it.isFile }.associateBy {
+                      it.relativeTo(root).path.replace(File.separatorChar, '/').lowercase()
+                  }
+              }
+
+              fun isReady(): Boolean = manifestFile.isFile && entryPath() != null
+
+              fun entryPath(): String? {
+                  if (File(root, "index.html").isFile) return "index.html"
+                  if (!root.isDirectory) return null
+                  val html = root.walkTopDown()
+                      .filter { it.isFile && it.extension.lowercase() in setOf("html", "htm") }.toList()
+                  val entry = html.firstOrNull { it.nameWithoutExtension.equals("index", true) }
+                      ?: html.firstOrNull()
+                  return entry?.relativeTo(root)?.path?.replace(File.separatorChar, '/')
+              }
+
+              fun localFile(relRaw: String): File? {
+                  val rel = relRaw.replace('\\', '/').ifEmpty { entryPath() ?: return null }
+                  val direct = File(root, rel)
+                  if (direct.isFile && direct.canonicalPath.startsWith(rootCanonical + File.separator)) return direct
+                  val alt = indexByLower[rel.lowercase()] ?: return null
+                  return alt.takeIf { it.isFile && it.canonicalPath.startsWith(rootCanonical + File.separator) }
+              }
+
+              fun loadManifest(): JSONObject =
+                  if (manifestFile.isFile) try { JSONObject(manifestFile.readText()) } catch (e: Exception) { JSONObject() }
+                  else JSONObject()
+
+              fun saveManifest(remote: List<YandexDisk.Remote>) {
+                  val o = JSONObject()
+                  remote.forEach { o.put(it.path, JSONObject().put("size", it.size).put("md5", it.md5 ?: "")) }
+                  manifestFile.writeText(o.toString())
+              }
+
+              fun needsDownload(r: YandexDisk.Remote, manifest: JSONObject): Boolean {
+                  localFile(r.path.trimStart('/')) ?: return true
+                  val m = manifest.optJSONObject(r.path) ?: return true
+                  if (m.optLong("size", -1) != r.size) return true
+                  return r.md5 != null && m.optString("md5") != r.md5
+              }
+
+              fun deleteObsolete(remote: List<YandexDisk.Remote>) {
+                  val keep = remote.map { it.path.trimStart('/') }.toHashSet()
+                  root.walkBottomUp().forEach { f ->
+                      if (f.isFile && f.relativeTo(root).path.replace(File.separatorChar, '/') !in keep) f.delete()
+                  }
+              }
+
+              companion object {
+                  fun mimeFor(name: String): String = when (name.substringAfterLast('.', "").lowercase()) {
+                      "html", "htm" -> "text/html"
+                      "css" -> "text/css"
+                      "js" -> "application/javascript"
+                      "json" -> "application/json"
+                      "png" -> "image/png"
+                      "jpg", "jpeg" -> "image/jpeg"
+                      "gif" -> "image/gif"
+                      "svg" -> "image/svg+xml"
+                      "webp" -> "image/webp"
+                      "bmp" -> "image/bmp"
+                      "ico" -> "image/x-icon"
+                      "ttf" -> "font/ttf"
+                      "otf" -> "font/otf"
+                      "woff" -> "font/woff"
+                      "woff2" -> "font/woff2"
+                      "eot" -> "application/vnd.ms-fontobject"
+                      "pdf" -> "application/pdf"
+                      "txt" -> "text/plain"
+                      "xml" -> "text/xml"
+                      else -> "application/octet-stream"
+                  }
+
+                  fun detectCharset(bytes: ByteArray): String {
+                      val head = String(bytes, 0, minOf(bytes.size, 2048), Charsets.ISO_8859_1)
+                      val declared = Regex("charset\\s*=\\s*[\"']?([A-Za-z0-9_\\-]+)", RegexOption.IGNORE_CASE)
+                          .find(head)?.groupValues?.get(1)
+                      if (declared != null) try { Charset.forName(declared); return declared } catch (e: Exception) {}
+                      return try {
+                          Charsets.UTF_8.newDecoder()
+                              .onMalformedInput(CodingErrorAction.REPORT)
+                              .onUnmappableCharacter(CodingErrorAction.REPORT)
+                              .decode(ByteBuffer.wrap(bytes))
+                          "UTF-8"
+                      } catch (e: CharacterCodingException) { "windows-1251" }
+                  }
+
+                  fun readText(bytes: ByteArray): String = String(bytes, Charset.forName(detectCharset(bytes)))
+              }
+          }
+          EOF
+          cat > app/src/main/java/ru/byd/manual/Translator.kt <<'EOF'
+          package ru.byd.manual
+
+          import android.content.Context
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.nl.translate.TranslateLanguage
+          import com.google.mlkit.nl.translate.Translation
+          import com.google.mlkit.nl.translate.TranslatorOptions
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.util.concurrent.ConcurrentHashMap
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+          import java.util.concurrent.atomic.AtomicInteger
+
+          object Translator {
+
+              @Volatile var ready = false
+              @Volatile var error: String? = null
+              @Volatile private var initialized = false
+
+              private lateinit var cacheFile: File
+              private val exec = Executors.newSingleThreadExecutor()
+              private val cache = ConcurrentHashMap<String, String>()
+              private val results = ConcurrentHashMap<String, String>()
+              private val ticketSeq = AtomicInteger(0)
+              private val dirty = AtomicInteger(0)
+
+              private val enRu by lazy {
+                  Translation.getClient(
+                      TranslatorOptions.Builder()
+                          .setSourceLanguage(TranslateLanguage.ENGLISH)
+                          .setTargetLanguage(TranslateLanguage.RUSSIAN).build()
+                  )
+              }
+              private val ruEn by lazy {
+                  Translation.getClient(
+                      TranslatorOptions.Builder()
+                          .setSourceLanguage(TranslateLanguage.RUSSIAN)
+                          .setTargetLanguage(TranslateLanguage.ENGLISH).build()
+                  )
+              }
+
+              private val glossary = mapOf(
+                  "removal" to "Снятие",
+                  "installation" to "Установка",
+                  "disassembly" to "Разборка",
+                  "reassembly" to "Сборка",
+                  "inspection" to "Проверка",
+                  "adjustment" to "Регулировка",
+                  "replacement" to "Замена",
+                  "components" to "Компоненты",
+                  "component location" to "Расположение компонентов",
+                  "location diagram" to "Схема расположения",
+                  "torque specifications" to "Моменты затяжки",
+                  "tightening torque" to "Момент затяжки",
+                  "service limit" to "Предел износа",
+                  "standard value" to "Номинальное значение",
+                  "general information" to "Общая информация",
+                  "specifications" to "Технические характеристики",
+                  "special tools" to "Специальный инструмент",
+                  "service tools" to "Сервисный инструмент",
+                  "precautions" to "Меры предосторожности",
+                  "warning" to "Внимание!",
+                  "caution" to "Осторожно!",
+                  "note" to "Примечание",
+                  "repair" to "Ремонт",
+                  "overhaul" to "Капитальный ремонт",
+                  "troubleshooting" to "Поиск неисправностей",
+                  "diagnosis" to "Диагностика",
+                  "diagnostic trouble codes" to "Коды неисправностей (DTC)",
+                  "wiring diagram" to "Электрическая схема",
+                  "connector" to "Разъём",
+                  "harness" to "Жгут проводов",
+                  "ground" to "Масса (заземление)",
+                  "power supply" to "Питание",
+                  "fuse" to "Предохранитель",
+                  "relay" to "Реле",
+                  "brake pad" to "Тормозная колодка",
+                  "brake disc" to "Тормозной диск",
+                  "caliper" to "Суппорт",
+                  "airbag" to "Подушка безопасности",
+                  "seat belt" to "Ремень безопасности",
+                  "suspension" to "Подвеска",
+                  "steering" to "Рулевое управление",
+                  "wheel alignment" to "Углы установки колёс",
+                  "tire pressure" to "Давление в шинах",
+                  "coolant" to "Охлаждающая жидкость",
+                  "transmission" to "Трансмиссия",
+                  "clutch" to "Сцепление",
+                  "driveshaft" to "Приводной вал",
+                  "engine" to "Двигатель",
+                  "exhaust" to "Выхлопная система",
+                  "fuel system" to "Топливная система",
+                  "a/c" to "Кондиционер",
+                  "body electrical" to "Электрооборудование кузова",
+                  "combination meter" to "Комбинация приборов",
+                  "wiper" to "Стеклоочиститель",
+                  "washer" to "Омыватель",
+                  "power window" to "Стеклоподъёмник",
+                  "sunroof" to "Люк",
+                  "high voltage" to "Высокое напряжение",
+                  "power battery" to "Тяговая батарея",
+                  "battery pack" to "Тяговая батарея",
+                  "drive motor" to "Тяговый электромотор",
+                  "motor controller" to "Контроллер электромотора (инвертор)",
+                  "on-board charger" to "Бортовое зарядное устройство",
+                  "charging" to "Зарядка",
+                  "reduction gear" to "Редуктор",
+                  "parking brake" to "Стояночный тормоз"
+              )
+
+              fun init(context: Context) {
+                  if (initialized) return
+                  initialized = true
+                  cacheFile = File(context.applicationContext.filesDir, "tr_cache.json")
+                  exec.submit {
+                      if (cacheFile.isFile) try {
+                          val o = JSONObject(cacheFile.readText())
+                          for (k in o.keys()) cache[k] = o.optString(k)
+                      } catch (e: Exception) {}
+                      downloadModels()
+                  }
+              }
+
+              fun retry() {
+                  error = null
+                  exec.submit { downloadModels() }
+              }
+
+              private fun downloadModels() {
+                  try {
+                      Tasks.await(enRu.downloadModelIfNeeded(), 10, TimeUnit.MINUTES)
+                      Tasks.await(ruEn.downloadModelIfNeeded(), 10, TimeUnit.MINUTES)
+                      ready = true
+                      error = null
+                  } catch (e: Exception) {
+                      error = e.message ?: "download error"
+                  }
+              }
+
+              fun tr(text: String): String {
+                  val key = text.trim()
+                  if (key.isEmpty()) return text
+                  cache[key]?.let { return it }
+                  glossary[key.lowercase()]?.let {
+                      cache[key] = it
+                      return it
+                  }
+                  return try {
+                      val r = Tasks.await(enRu.translate(key), 20, TimeUnit.SECONDS)
+                      if (cache.size < 40000) {
+                          cache[key] = r
+                          if (dirty.incrementAndGet() >= 80) flush()
+                      }
+                      r
+                  } catch (e: Exception) { key }
+              }
+
+              fun ruToEn(text: String): String = try {
+                  Tasks.await(ruEn.translate(text), 15, TimeUnit.SECONDS)
+              } catch (e: Exception) { "" }
+
+              fun request(payload: String): String {
+                  val ticket = "t" + ticketSeq.incrementAndGet()
+                  exec.submit {
+                      try {
+                          val o = JSONObject(payload)
+                          val items = o.getJSONArray("items")
+                          val out = JSONArray()
+                          for (i in 0 until items.length()) {
+                              val pair = items.getJSONArray(i)
+                              out.put(JSONArray().put(pair.getInt(0)).put(tr(pair.getString(1))))
+                          }
+                          val res = JSONObject().put("items", out)
+                          val title = o.optString("title", "")
+                          if (title.isNotBlank()) res.put("title", tr(title))
+                          results[ticket] = res.toString()
+                      } catch (e: Exception) {
+                          results[ticket] = "{\"items\":[]}"
+                      }
+                  }
+                  return ticket
+              }
+
+              fun poll(ticket: String): String = results.remove(ticket) ?: ""
+
+              fun flush() {
+                  if (dirty.get() == 0) return
+                  exec.submit {
+                      if (dirty.getAndSet(0) == 0) return@submit
+                      try {
+                          val tmp = File(cacheFile.parentFile, cacheFile.name + ".tmp")
+                          tmp.writeText(JSONObject(cache.toMap()).toString())
+                          tmp.renameTo(cacheFile)
+                      } catch (e: Exception) {}
+                  }
+              }
+          }
+          EOF
+          cat > app/src/main/java/ru/byd/manual/SyncActivity.kt <<'EOF'
+          package ru.byd.manual
+
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.Button
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.coroutineScope
+          import kotlinx.coroutines.currentCoroutineContext
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.ensureActive
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import kotlinx.coroutines.sync.Semaphore
+          import kotlinx.coroutines.sync.withPermit
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.concurrent.atomic.AtomicInteger
+          import java.util.concurrent.atomic.AtomicLong
+
+          class SyncActivity : AppCompatActivity() {
+
+              private lateinit var store: ManualStore
+              private lateinit var status: TextView
+              private lateinit var detail: TextView
+              private lateinit var bar: ProgressBar
+              private lateinit var retryBtn: Button
+              private var job: Job? = null
+
+              @Volatile private var totalFiles = 0
+              @Volatile private var totalBytes = 0L
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_sync)
+                  store = ManualStore(this)
+                  status = findViewById(R.id.syncStatus)
+                  detail = findViewById(R.id.syncDetail)
+                  bar = findViewById(R.id.syncBar)
+                  retryBtn = findViewById(R.id.syncRetry)
+                  retryBtn.setOnClickListener { startSync() }
+                  findViewById<Button>(R.id.syncCancel).setOnClickListener {
+                      job?.cancel(); setResult(RESULT_CANCELED); finish()
+                  }
+                  startSync()
+              }
+
+              private fun startSync() {
+                  job?.cancel()
+                  totalFiles = 0; totalBytes = 0
+                  retryBtn.visibility = View.GONE
+                  bar.visibility = View.VISIBLE
+                  bar.isIndeterminate = true
+                  status.setText(R.string.sync_listing)
+                  detail.text = ""
+
+                  val doneFiles = AtomicInteger(0)
+                  val doneBytes = AtomicLong(0)
+
+                  job = lifecycleScope.launch {
+                      val ticker = launch {
+                          while (true) {
+                              if (totalFiles > 0) {
+                                  bar.isIndeterminate = false
+                                  bar.max = totalFiles
+                                  bar.progress = doneFiles.get()
+                                  detail.text = getString(
+                                      R.string.sync_progress,
+                                      doneFiles.get(), totalFiles,
+                                      doneBytes.get() / 1048576.0, totalBytes / 1048576.0
+                                  )
+                              }
+                              delay(250)
+                          }
+                      }
+                      try {
+                          withContext(Dispatchers.IO) { doSync(doneFiles, doneBytes) }
+                          setResult(RESULT_OK)
+                          finish()
+                      } catch (e: CancellationException) {
+                          throw e
+                      } catch (e: Exception) {
+                          status.setText(R.string.sync_error_title)
+                          detail.text = getString(R.string.sync_error_body, e.message ?: "")
+                          retryBtn.visibility = View.VISIBLE
+                          bar.visibility = View.GONE
+                      } finally {
+                          ticker.cancel()
+                      }
+                  }
+              }
+
+              private suspend fun doSync(doneFiles: AtomicInteger, doneBytes: AtomicLong) {
+                  val remote = YandexDisk.listAll()
+                  if (remote.none { it.path.equals("/index.html", true) })
+                      throw IllegalStateException("index.html not found in the folder")
+
+                  val manifest = store.loadManifest()
+                  val todo = remote.filter { store.needsDownload(it, manifest) }
+                  totalFiles = todo.size
+                  totalBytes = todo.sumOf { it.size }
+                  store.root.mkdirs()
+                  runOnUiThread { status.setText(R.string.sync_downloading) }
+
+                  val sem = Semaphore(6)
+                  val failed = ArrayList<String>()
+                  coroutineScope {
+                      todo.forEach { r ->
+                          launch {
+                              sem.withPermit {
+                                  try {
+                                      download(r)
+                                      doneFiles.incrementAndGet()
+                                      doneBytes.addAndGet(r.size)
+                                  } catch (e: CancellationException) {
+                                      throw e
+                                  } catch (e: Exception) {
+                                      synchronized(failed) { failed.add(r.path) }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  if (failed.isNotEmpty())
+                      throw IllegalStateException("Failed files: ${failed.size} (e.g. ${failed.first()})")
+
+                  store.deleteObsolete(remote)
+                  store.saveManifest(remote)
+              }
+
+              private suspend fun download(r: YandexDisk.Remote) {
+                  val rel = r.path.trimStart('/')
+                  val dst = File(store.root, rel)
+                  dst.parentFile?.mkdirs()
+                  val tmp = File(dst.parentFile, dst.name + ".part")
+                  var lastErr: Exception? = null
+                  for (attempt in 0 until 3) {
+                      currentCoroutineContext().ensureActive()
+                      try {
+                          val u = if (attempt == 0 && r.url != null) r.url else YandexDisk.downloadHref(r.path)
+                          YandexDisk.open(u).inputStream.use { input ->
+                              FileOutputStream(tmp).use { out ->
+                                  val buf = ByteArray(64 * 1024)
+                                  while (true) {
+                                      currentCoroutineContext().ensureActive()
+                                      val n = input.read(buf)
+                                      if (n < 0) break
+                                      out.write(buf, 0, n)
+                                  }
+                              }
+                          }
+                          if (dst.exists()) dst.delete()
+                          if (!tmp.renameTo(dst)) throw IllegalStateException("Cannot save $rel")
+                          return
+                      } catch (e: CancellationException) {
+                          tmp.delete(); throw e
+                      } catch (e: Exception) {
+                          lastErr = e
+                          delay(600L * (attempt + 1))
+                      }
+                  }
+                  tmp.delete()
+                  throw lastErr ?: IllegalStateException("Download error $rel")
+              }
+          }
+          EOF
+          cat > app/src/main/java/ru/byd/manual/MainActivity.kt <<'EOF'
+          package ru.byd.manual
+
+          import android.annotation.SuppressLint
+          import android.content.ActivityNotFoundException
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.Menu
+          import android.view.MenuItem
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebChromeClient
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebResourceResponse
+          import android.webkit.WebSettings
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.OnBackPressedCallback
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.appcompat.widget.Toolbar
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import java.io.ByteArrayInputStream
+          import java.io.FileInputStream
+          import java.nio.charset.Charset
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var store: ManualStore
+              private lateinit var web: WebView
+              private lateinit var emptyState: LinearLayout
+              private lateinit var pageBar: ProgressBar
+              private lateinit var trBanner: TextView
+              private val prefs by lazy { getSharedPreferences("settings", MODE_PRIVATE) }
+
+              companion object {
+                  private const val HOST = "manual.local"
+                  private val BOOT_JS = """
+          (function () {
+            if (window.__trBoot) return; window.__trBoot = true;
+            if (!window.AndroidTr) return;
+            var SKIP = { SCRIPT: 1, STYLE: 1, NOSCRIPT: 1, CODE: 1, PRE: 1, TEXTAREA: 1, INPUT: 1, SELECT: 1 };
+            var done = new WeakSet();
+            var busy = false;
+            var badge = null;
+            var titleDone = false;
+            function bad(s) {
+              var t = s.trim();
+              if (t.length < 2) return true;
+              if (!/[A-Za-z]/.test(t)) return true;
+              if (/^[A-Z0-9 .,\-\/_:+()]*$/.test(t)) return true;
+              var letters = (t.match(/[A-Za-z]/g) || []).length;
+              if (letters * 3 < t.replace(/\s+/g, '').length) return true;
+              return false;
+            }
+            function collect() {
+              var arr = [];
+              var root = document.body || document.documentElement;
+              if (!root) return arr;
+              var w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+              var n;
+              while ((n = w.nextNode())) {
+                if (done.has(n)) continue;
+                var p = n.parentNode;
+                if (!p || SKIP[p.nodeName]) { done.add(n); continue; }
+                if (bad(n.nodeValue)) { done.add(n); continue; }
+                arr.push(n);
+                if (arr.length >= 40) break;
+              }
+              return arr;
+            }
+            function showBadge(on) {
+              if (on) {
+                if (!badge) {
+                  badge = document.createElement('div');
+                  badge.textContent = 'Перевожу…';
+                  badge.style.cssText = 'position:fixed;right:8px;bottom:8px;background:#1565C0;color:#fff;padding:4px 12px;border-radius:14px;font:12px sans-serif;z-index:2147483647;opacity:0.9;pointer-events:none;';
+                  (document.body || document.documentElement).appendChild(badge);
+                }
+              } else if (badge) { badge.remove(); badge = null; }
+            }
+            function run() {
+              if (busy) return;
+              if (!window.AndroidTr || !AndroidTr.isReady()) return;
+              var nodes = collect();
+              var wantTitle = !titleDone && /[A-Za-z]/.test(document.title || '');
+              if (nodes.length === 0 && !wantTitle) { showBadge(false); return; }
+              busy = true; showBadge(true);
+              var items = [];
+              for (var i = 0; i < nodes.length; i++) items.push([i, nodes[i].nodeValue.trim()]);
+              var payload = JSON.stringify({ items: items, title: wantTitle ? document.title : '' });
+              var ticket;
+              try { ticket = AndroidTr.request(payload); } catch (e) { busy = false; showBadge(false); return; }
+              var iv = setInterval(function () {
+                var res = '';
+                try { res = AndroidTr.poll(ticket); } catch (e) {}
+                if (!res) return;
+                clearInterval(iv);
+                try {
+                  var data = JSON.parse(res);
+                  var map = {};
+                  for (var j = 0; j < data.items.length; j++) map[data.items[j][0]] = data.items[j][1];
+                  for (var k = 0; k < nodes.length; k++) {
+                    var n = nodes[k];
+                    done.add(n);
+                    var ru = map[k];
+                    if (ru && ru !== n.nodeValue.trim()) {
+                      var m = n.nodeValue.match(/^(\s*)([\s\S]*?)(\s*)$/);
+                      n.nodeValue = m[1] + ru + m[3];
+                    }
+                  }
+                  if (data.title) { document.title = data.title; }
+                  titleDone = true;
+                } catch (e) {}
+                busy = false;
+                setTimeout(run, 30);
+              }, 200);
+            }
+            function schedule() { setTimeout(run, 250); }
+            function start() {
+              var iv = setInterval(function () {
+                if (window.AndroidTr && AndroidTr.isReady()) { clearInterval(iv); run(); }
+              }, 700);
+              try {
+                new MutationObserver(function () { if (!busy) schedule(); })
+                  .observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+              } catch (e) {}
+            }
+            if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+            else start();
+          })();
+          """.trimIndent()
+              }
+
+              private inner class TrBridge {
+                  @JavascriptInterface fun isReady(): Boolean = Translator.ready
+                  @JavascriptInterface fun request(payload: String): String = Translator.request(payload)
+                  @JavascriptInterface fun poll(ticket: String): String = Translator.poll(ticket)
+              }
+
+              private val syncLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+                      if (store.isReady()) {
+                          emptyState.visibility = View.GONE
+                          web.visibility = View.VISIBLE
+                          if (web.url.isNullOrEmpty()) loadEntry() else web.reload()
+                      } else {
+                          web.visibility = View.GONE
+                          emptyState.visibility = View.VISIBLE
+                      }
+                  }
+
+              private val searchLauncher =
+                  registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+                      val path = res.data?.getStringExtra("path")
+                      if (res.resultCode == RESULT_OK && path != null) loadPage(path)
+                  }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  store = ManualStore(this)
+                  Translator.init(this)
+
+                  val toolbar = findViewById<Toolbar>(R.id.toolbar)
+                  setSupportActionBar(toolbar)
+
+                  pageBar = findViewById(R.id.pageBar)
+                  emptyState = findViewById(R.id.emptyState)
+                  trBanner = findViewById(R.id.trBanner)
+                  trBanner.setOnClickListener { Translator.retry() }
+                  findViewById<Button>(R.id.btnDownload).setOnClickListener {
+                      syncLauncher.launch(Intent(this, SyncActivity::class.java))
+                  }
+
+                  web = findViewById(R.id.web)
+                  web.settings.apply {
+                      javaScriptEnabled = true
+                      domStorageEnabled = true
+                      builtInZoomControls = true
+                      displayZoomControls = false
+                      useWideViewPort = true
+                      loadWithOverviewMode = true
+                      allowFileAccess = false
+                      allowContentAccess = false
+                      cacheMode = WebSettings.LOAD_NO_CACHE
+                      textZoom = prefs.getInt("textZoom", 100)
+                  }
+                  web.addJavascriptInterface(TrBridge(), "AndroidTr")
+                  web.webViewClient = object : WebViewClient() {
+
+                      override fun shouldInterceptRequest(
+                          view: WebView, request: WebResourceRequest
+                      ): WebResourceResponse? {
+                          val url = request.url
+                          if (!url.host.equals(HOST, true)) return null
+                          val rel = Uri.decode(url.encodedPath ?: "/").trimStart('/')
+                          val f = store.localFile(rel) ?: return notFound()
+                          return try {
+                              val mime = ManualStore.mimeFor(f.name)
+                              if (mime == "text/html") {
+                                  val bytes = f.readBytes()
+                                  val cs = ManualStore.detectCharset(bytes)
+                                  var html = String(bytes, Charset.forName(cs))
+                                  if (store.translateEnabled) html += "\n<script>" + BOOT_JS + "</script>"
+                                  WebResourceResponse(mime, cs,
+                                      ByteArrayInputStream(html.toByteArray(Charset.forName(cs))))
+                              } else {
+                                  WebResourceResponse(mime, null, FileInputStream(f))
+                              }
+                          } catch (e: Exception) { notFound() }
+                      }
+
+                      override fun shouldOverrideUrlLoading(
+                          view: WebView, request: WebResourceRequest
+                      ): Boolean {
+                          val url = request.url
+                          if (url.host.equals(HOST, true)) return false
+                          return when (url.scheme?.lowercase()) {
+                              "http", "https", "mailto", "tel" -> {
+                                  try { startActivity(Intent(Intent.ACTION_VIEW, url)) }
+                                  catch (e: ActivityNotFoundException) { toast(getString(R.string.no_app)) }
+                                  true
+                              }
+                              else -> false
+                          }
+                      }
+                  }
+                  web.webChromeClient = object : WebChromeClient() {
+                      override fun onProgressChanged(view: WebView, newProgress: Int) {
+                          pageBar.visibility = if (newProgress >= 100) View.GONE else View.VISIBLE
+                          pageBar.progress = newProgress
+                      }
+                      override fun onReceivedTitle(view: WebView, title: String?) {
+                          if (!title.isNullOrBlank()) supportActionBar?.subtitle = title
+                      }
+                  }
+
+                  onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                      override fun handleOnBackPressed() {
+                          if (web.canGoBack()) web.goBack() else finish()
+                      }
+                  })
+
+                  applyKeepScreenOn()
+                  watchTranslator()
+
+                  if (store.isReady()) {
+                      emptyState.visibility = View.GONE
+                      loadEntry()
+                  } else {
+                      web.visibility = View.GONE
+                      emptyState.visibility = View.VISIBLE
+                      syncLauncher.launch(Intent(this, SyncActivity::class.java))
+                  }
+              }
+
+              private fun watchTranslator() {
+                  lifecycleScope.launch {
+                      var wasDownloading = false
+                      while (true) {
+                          if (!store.translateEnabled) {
+                              trBanner.visibility = View.GONE
+                              wasDownloading = false
+                          } else if (Translator.ready) {
+                              if (wasDownloading) {
+                                  trBanner.setText(R.string.tr_ready)
+                                  trBanner.visibility = View.VISIBLE
+                                  delay(1500)
+                                  wasDownloading = false
+                              }
+                              trBanner.visibility = View.GONE
+                          } else if (Translator.error != null) {
+                              trBanner.visibility = View.VISIBLE
+                              trBanner.setText(R.string.tr_error)
+                              wasDownloading = true
+                          } else {
+                              trBanner.visibility = View.VISIBLE
+                              trBanner.setText(R.string.tr_downloading)
+                              wasDownloading = true
+                          }
+                          delay(600)
+                      }
+                  }
+              }
+
+              private fun notFound() = WebResourceResponse(
+                  "text/plain", "utf-8", 404, "Not Found", emptyMap(),
+                  ByteArrayInputStream("404".toByteArray())
+              )
+
+              private fun loadEntry() {
+                  val e = store.entryPath()
+                  if (e == null) {
+                      emptyState.visibility = View.VISIBLE; web.visibility = View.GONE; return
+                  }
+                  loadPage(e)
+              }
+
+              private fun loadPage(rel: String) {
+                  emptyState.visibility = View.GONE
+                  web.visibility = View.VISIBLE
+                  web.loadUrl("https://$HOST/" + Uri.encode(rel, "/"))
+              }
+
+              override fun onCreateOptionsMenu(menu: Menu): Boolean {
+                  menuInflater.inflate(R.menu.main, menu)
+                  menu.findItem(R.id.action_keep_screen).isChecked = prefs.getBoolean("keepOn", false)
+                  menu.findItem(R.id.action_translate).isChecked = store.translateEnabled
+                  return true
+              }
+
+              override fun onOptionsItemSelected(item: MenuItem): Boolean {
+                  when (item.itemId) {
+                      R.id.action_home -> loadEntry()
+                      R.id.action_search -> searchLauncher.launch(Intent(this, SearchActivity::class.java))
+                      R.id.action_translate -> {
+                          val v = !item.isChecked
+                          item.isChecked = v
+                          store.translateEnabled = v
+                          if (v && !Translator.ready) Translator.retry()
+                          web.reload()
+                      }
+                      R.id.action_update -> syncLauncher.launch(Intent(this, SyncActivity::class.java))
+                      R.id.action_text_plus -> changeZoom(+10)
+                      R.id.action_text_minus -> changeZoom(-10)
+                      R.id.action_keep_screen -> {
+                          val v = !item.isChecked
+                          item.isChecked = v
+                          prefs.edit().putBoolean("keepOn", v).apply()
+                          applyKeepScreenOn()
+                      }
+                      else -> return super.onOptionsItemSelected(item)
+                  }
+                  return true
+              }
+
+              private fun changeZoom(delta: Int) {
+                  val z = (prefs.getInt("textZoom", 100) + delta).coerceIn(50, 250)
+                  web.settings.textZoom = z
+                  prefs.edit().putInt("textZoom", z).apply()
+                  toast(getString(R.string.text_size, z))
+              }
+
+              private fun applyKeepScreenOn() {
+                  if (prefs.getBoolean("keepOn", false))
+                      window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  else
+                      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              }
+
+              private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+              override fun onPause() {
+                  super.onPause()
+                  Translator.flush()
+              }
+
+              override fun onDestroy() {
+                  if (::web.isInitialized) {
+                      (web.parent as? ViewGroup)?.removeView(web)
+                      web.destroy()
+                  }
+                  super.onDestroy()
+              }
+          }
+          EOF
+          cat > app/src/main/java/ru/byd/manual/SearchActivity.kt <<'EOF'
+          package ru.byd.manual
+
+          import android.os.Bundle
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ListView
+          import android.widget.ProgressBar
+          import android.widget.SimpleAdapter
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.lifecycle.lifecycleScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+
+          class SearchActivity : AppCompatActivity() {
+
+              private lateinit var store: ManualStore
+              private lateinit var query: EditText
+              private lateinit var progress: ProgressBar
+              private lateinit var info: TextView
+              private lateinit var list: ListView
+              private var job: Job? = null
+
+              private data class Hit(val title: String, val snippet: String, val path: String)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_search)
+                  store = ManualStore(this)
+                  Translator.init(this)
+                  query = findViewById(R.id.searchQuery)
+                  progress = findViewById(R.id.searchProgress)
+                  info = findViewById(R.id.searchInfo)
+                  list = findViewById(R.id.searchList)
+
+                  findViewById<Button>(R.id.searchGo).setOnClickListener { search() }
+                  query.setOnEditorActionListener { _, actionId, _ ->
+                      if (actionId == EditorInfo.IME_ACTION_SEARCH) { search(); true } else false
+                  }
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      val item = list.adapter?.getItem(pos) as? Map<*, *>
+                      val path = item?.get("path") as? String ?: return@setOnItemClickListener
+                      setResult(RESULT_OK, intent.putExtra("path", path))
+                      finish()
+                  }
+              }
+
+              private fun search() {
+                  val q = query.text.toString().trim()
+                  if (q.length < 2) {
+                      Toast.makeText(this, R.string.search_min, Toast.LENGTH_SHORT).show(); return
+                  }
+                  job?.cancel()
+                  progress.visibility = View.VISIBLE
+                  info.setText(R.string.searching)
+                  list.adapter = null
+                  job = lifecycleScope.launch {
+                      val (results, en) = withContext(Dispatchers.IO) { doSearch(q) }
+                      progress.visibility = View.GONE
+                      val sb = StringBuilder()
+                      sb.append(if (results.isEmpty()) getString(R.string.search_none)
+                                else getString(R.string.search_found, results.size))
+                      if (en.isNotBlank()) sb.append("\n").append(getString(R.string.search_translated, en))
+                      info.text = sb.toString()
+                      val data = results.map {
+                          hashMapOf("title" to it.title, "snippet" to it.snippet, "path" to it.path)
+                      }
+                      list.adapter = SimpleAdapter(
+                          this@SearchActivity, data, android.R.layout.simple_list_item_2,
+                          arrayOf("title", "snippet"), intArrayOf(android.R.id.text1, android.R.id.text2)
+                      )
+                  }
+              }
+
+              private fun doSearch(q: String): Pair<List<Hit>, String> {
+                  val terms = mutableListOf(q)
+                  var en = ""
+                  val hasCyr = q.any { it in 'а'..'я' || it in 'А'..'Я' || it == 'ё' || it == 'Ё' }
+                  if (Translator.ready && hasCyr) {
+                      en = Translator.ruToEn(q)
+                      if (en.isNotBlank() && !en.equals(q, true)) terms.add(en)
+                  }
+                  val needles = terms.map { it.lowercase() }
+                  val out = ArrayList<Hit>()
+                  val files = store.root.walkTopDown()
+                      .filter { it.isFile && it.extension.lowercase() in setOf("html", "htm") }.toList()
+                  val reTitle = Regex("<title[^>]*>(.*?)</title>",
+                      setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+                  val reScript = Regex("<script[^>]*>.*?</script>",
+                      setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+                  val reStyle = Regex("<style[^>]*>.*?</style>",
+                      setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+                  val reTag = Regex("<[^>]+>")
+                  val reWs = Regex("\\s+")
+
+                  for (f in files) {
+                      if (out.size >= 300) break
+                      val html = try { ManualStore.readText(f.readBytes()) } catch (e: Exception) { continue }
+                      val title = reTitle.find(html)?.groupValues?.get(1)?.trim()?.ifBlank { null } ?: f.name
+                      val plain = html
+                          .replace(reScript, " ").replace(reStyle, " ")
+                          .replace(reTag, " ")
+                          .replace("&nbsp;", " ").replace("&amp;", "&")
+                          .replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"")
+                          .replace(reWs, " ").trim()
+                      val low = plain.lowercase()
+                      var perFile = 0
+                      for (needle in needles) {
+                          var idx = 0
+                          while (perFile < 3 && out.size < 300) {
+                              val i = low.indexOf(needle, idx)
+                              if (i < 0) break
+                              val s = maxOf(0, i - 60)
+                              val e = minOf(plain.length, i + needle.length + 90)
+                              val snip = (if (s > 0) "…" else "") + plain.substring(s, e) +
+                                         (if (e < plain.length) "…" else "")
+                              out.add(Hit(title, snip,
+                                  f.relativeTo(store.root).path.replace(File.separatorChar, '/')))
+                              perFile++
+                              idx = i + needle.length
+                          }
+                      }
+                  }
+                  val shown = if (Translator.ready)
+                      out.map { Hit(Translator.tr(it.title), Translator.tr(it.snippet), it.path) }
+                  else out
+                  return shown to en
+              }
+          }
+          EOF
+          cat > app/src/main/res/layout/activity_main.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical">
+              <androidx.appcompat.widget.Toolbar
+                  android:id="@+id/toolbar"
+                  android:layout_width="match_parent"
+                  android:layout_height="?attr/actionBarSize"
+                  android:background="?attr/colorPrimary"
+                  android:theme="@style/ThemeOverlay.AppCompat.Dark.ActionBar"
+                  app:popupTheme="@style/ThemeOverlay.AppCompat.Light" />
+              <TextView
+                  android:id="@+id/trBanner"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:background="#FFF3E0"
+                  android:textColor="#5D4037"
+                  android:textSize="13sp"
+                  android:padding="8dp"
+                  android:visibility="gone" />
+              <ProgressBar
+                  android:id="@+id/pageBar"
+                  style="?android:attr/progressBarStyleHorizontal"
+                  android:layout_width="match_parent"
+                  android:layout_height="3dp"
+                  android:max="100"
+                  android:visibility="gone" />
+              <FrameLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1">
+                  <WebView
+                      android:id="@+id/web"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent" />
+                  <LinearLayout
+                      android:id="@+id/emptyState"
+                      android:layout_width="match_parent"
+                      android:layout_height="match_parent"
+                      android:orientation="vertical"
+                      android:gravity="center"
+                      android:padding="32dp"
+                      android:visibility="gone">
+                      <TextView
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="@string/empty_text"
+                          android:textSize="16sp"
+                          android:gravity="center" />
+                      <Button
+                          android:id="@+id/btnDownload"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:layout_marginTop="24dp"
+                          android:text="@string/empty_download" />
+                  </LinearLayout>
+              </FrameLayout>
+          </LinearLayout>
+          EOF
+          cat > app/src/main/res/layout/activity_sync.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="24dp">
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="@string/sync_title"
+                  android:textSize="22sp"
+                  android:textStyle="bold" />
+              <TextView
+                  android:id="@+id/syncStatus"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="16dp"
+                  android:textSize="15sp" />
+              <ProgressBar
+                  android:id="@+id/syncBar"
+                  style="?android:attr/progressBarStyleHorizontal"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp" />
+              <TextView
+                  android:id="@+id/syncDetail"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp"
+                  android:textSize="14sp" />
+              <TextView
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="24dp"
+                  android:text="@string/sync_note"
+                  android:textSize="13sp"
+                  android:textColor="#757575" />
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="24dp"
+                  android:orientation="horizontal">
+                  <Button
+                      android:id="@+id/syncRetry"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="@string/retry"
+                      android:visibility="gone" />
+                  <Button
+                      android:id="@+id/syncCancel"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="12dp"
+                      android:text="@string/cancel" />
+              </LinearLayout>
+          </LinearLayout>
+          EOF
+          cat > app/src/main/res/layout/activity_search.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="16dp">
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="@string/search_title"
+                  android:textSize="20sp"
+                  android:textStyle="bold" />
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="12dp"
+                  android:orientation="horizontal">
+                  <EditText
+                      android:id="@+id/searchQuery"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:hint="@string/search_hint"
+                      android:inputType="text"
+                      android:maxLines="1"
+                      android:imeOptions="actionSearch" />
+                  <Button
+                      android:id="@+id/searchGo"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginStart="8dp"
+                      android:text="@string/search_go" />
+              </LinearLayout>
+              <ProgressBar
+                  android:id="@+id/searchProgress"
+                  style="?android:attr/progressBarStyleHorizontal"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:indeterminate="true"
+                  android:visibility="gone" />
+              <TextView
+                  android:id="@+id/searchInfo"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="8dp" />
+              <ListView
+                  android:id="@+id/searchList"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:layout_marginTop="8dp" />
+          </LinearLayout>
+          EOF
+          cat > app/src/main/res/menu/main.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <menu xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto">
+              <item android:id="@+id/action_home"
+                  android:title="@string/menu_home"
+                  android:icon="@drawable/ic_home"
+                  app:showAsAction="ifRoom" />
+              <item android:id="@+id/action_search"
+                  android:title="@string/menu_search"
+                  android:icon="@drawable/ic_search"
+                  app:showAsAction="ifRoom" />
+              <item android:id="@+id/action_translate"
+                  android:title="@string/menu_translate"
+                  android:checkable="true"
+                  app:showAsAction="never" />
+              <item android:id="@+id/action_update"
+                  android:title="@string/menu_update"
+                  app:showAsAction="never" />
+              <item android:id="@+id/action_text_plus"
+                  android:title="@string/menu_text_plus"
+                  app:showAsAction="never" />
+              <item android:id="@+id/action_text_minus"
+                  android:title="@string/menu_text_minus"
+                  app:showAsAction="never" />
+              <item android:id="@+id/action_keep_screen"
+                  android:title="@string/menu_keep_screen"
+                  android:checkable="true"
+                  app:showAsAction="never" />
+          </menu>
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Мануал BYD Song Plus</string>
+              <string name="menu_home">Оглавление</string>
+              <string name="menu_search">Поиск</string>
+              <string name="menu_translate">Перевод на русский (авто)</string>
+              <string name="menu_update">Обновить мануал</string>
+              <string name="menu_text_plus">Текст крупнее</string>
+              <string name="menu_text_minus">Текст мельче</string>
+              <string name="menu_keep_screen">Не гасить экран</string>
+              <string name="empty_text">Мануал ещё не загружен на телефон.\nНажмите кнопку — приложение скачает все файлы с Яндекс Диска, после чего будет работать без интернета.</string>
+              <string name="empty_download">Загрузить мануал</string>
+              <string name="sync_title">Загрузка мануала</string>
+              <string name="sync_listing">Получаю список файлов с Яндекс Диска… (до минуты)</string>
+              <string name="sync_downloading">Загружаю файлы на телефон…</string>
+              <string name="sync_progress">Файлы: %1$d из %2$d • %3$.1f из %4$.1f МБ</string>
+              <string name="sync_note">Первая загрузка занимает несколько минут — лучше по Wi-Fi. Можно нажать «Отмена»: уже скачанные файлы сохранятся, загрузка продолжится при следующем запуске. Русский языковой пакет (~60 МБ) скачается отдельно на главном экране.</string>
+              <string name="sync_error_title">Не удалось загрузить мануал</string>
+              <string name="sync_error_body">%1$s\n\nПроверьте интернет и нажмите «Повторить». Уже скачанные файлы не потеряются.</string>
+              <string name="retry">Повторить</string>
+              <string name="cancel">Отмена</string>
+              <string name="tr_downloading">Скачиваю русский языковой пакет (~60 МБ). Перевод включится автоматически…</string>
+              <string name="tr_error">Не удалось скачать языковой пакет. Нажмите здесь, чтобы повторить.</string>
+              <string name="tr_ready">Перевод готов ✓</string>
+              <string name="search_title">Поиск по мануалу</string>
+              <string name="search_hint">Например: тормозные колодки</string>
+              <string name="search_go">Найти</string>
+              <string name="searching">Ищу по всем страницам…</string>
+              <string name="search_none">Ничего не найдено</string>
+              <string name="search_found">Найдено совпадений: %1$d</string>
+              <string name="search_translated">Запрос переведён для поиска: «%1$s»</string>
+              <string name="search_min">Введите минимум 2 символа</string>
+              <string name="no_app">Нет приложения для открытия этой ссылки</string>
+              <string name="text_size">Размер текста: %1$d%%</string>
+          </resources>
+          EOF
+          cat > app/src/main/res/values/colors.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="primary">#1565C0</color>
+              <color name="primaryDark">#0D47A1</color>
+              <color name="accent">#FF8F00</color>
+              <color name="iconBg">#0D47A1</color>
+          </resources>
+          EOF
+          cat > app/src/main/res/values/themes.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.BydManual" parent="Theme.AppCompat.Light.NoActionBar">
+                  <item name="colorPrimary">@color/primary</item>
+                  <item name="colorPrimaryDark">@color/primaryDark</item>
+                  <item name="colorAccent">@color/accent</item>
+                  <item name="android:statusBarColor">@color/primaryDark</item>
+              </style>
+          </resources>
+          EOF
+          cat > app/src/main/res/drawable/ic_home.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M10,20v-6h4v6h5v-8h3L12,3 2,12h3v8z" />
+          </vector>
+          EOF
+          cat > app/src/main/res/drawable/ic_search.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M15.5,14h-0.79l-0.28,-0.27C15.41,12.59 16,11.11 16,9.5 16,5.91 13.09,3 9.5,3S3,5.91 3,9.5 5.91,16 9.5,16c1.61,0 3.09,-0.59 4.23,-1.57l0.27,0.28v0.79l5,4.99L20.49,19l-4.99,-5zM9.5,14C7.01,14 5,11.99 5,9.5S7.01,5 9.5,5 14,7.01 14,9.5 11.99,14 9.5,14z" />
+          </vector>
+          EOF
+          cat > app/src/main/res/drawable/ic_launcher_fg.xml <<'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <group android:translateX="30" android:translateY="30"
+                  android:scaleX="2" android:scaleY="2">
+                  <path android:fillColor="#FFFFFFFF"
+                      android:pathData="M22.7,19l-9.1,-9.1c0.9,-2.3 0.4,-5 -1.5,-6.9 -2,-2 -5,-2.4 -7.4,-1.3L9,6 6,9 1.6,4.7C0.4,7.1 0.9,10.1 2.9,12.1c1.9,1.9 4.6,2.4 6.9,1.5l9.1,9.1c0.4,0.4 1,0.4 1.4,0l2.3,-2.3c0.5,-0.4 0.5,-1.1 0.1,-1.4z" />
+              </group>
+          </vector>
+          EOF
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/iconBg" />
+              <foreground android:drawable="@drawable/ic_launcher_fg" />
+          </adaptive-icon>
+          EOF
+      - name: Build APK
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: byd-manual-rus-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
